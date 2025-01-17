@@ -1,0 +1,303 @@
+// Constants and configurations
+const CONFIG = {
+    AUTH_TYPES: {
+        BASIC: 'basic',
+        OAUTH: 'oauth'
+    },
+    VALID_ATS: ['workday'],
+    XML_PREFIXES: {
+        ENV: 'env',
+        WD: 'wd'
+    }
+};
+
+
+// Environment Manager Class
+class EnvironmentManager {
+    static get(key) {
+        return pm.environment.get(key);
+    }
+
+    static set(key, value) {
+        pm.environment.set(key, value);
+    }
+
+    static getRequiredVars(authType) {
+        const common = ['authentication_Type', 'ats'];
+        const authSpecific = {
+            [CONFIG.AUTH_TYPES.BASIC]: ['userName', 'domain', 'password', 'version'],
+            [CONFIG.AUTH_TYPES.OAUTH]: ['baseURL', 'grant_Type', 'client_id', 'client_secret', 'refresh_token', 'endpoint']
+        };
+        return [...common, ...(authSpecific[authType] || [])];
+    }
+
+    static validateEnvironment(authType) {
+        if (!Object.values(CONFIG.AUTH_TYPES).includes(authType)) {
+            throw new Error(`Invalid authentication type: ${authType}. Valid types are: ${Object.values(CONFIG.AUTH_TYPES).join(', ')}`);
+        }
+
+        const requiredVars = this.getRequiredVars(authType);
+        const missingVars = requiredVars.filter(varName => !this.get(varName));
+        
+        if (missingVars.length > 0) {
+            throw new Error(`Missing required environment variables: ${missingVars.join(', ')}`);
+        }
+
+        // Validate ATS
+        const ats = (this.get('ats') || '').toLowerCase();
+        if (!CONFIG.VALID_ATS.includes(ats)) {
+            throw new Error(`Invalid ATS value: ${ats}. Valid values are: ${CONFIG.VALID_ATS.join(', ')}`);
+        }
+
+        return true;
+    }
+}
+
+// XML Processing Class
+class XMLProcessor {
+    static validateXMLBody(xmlBody) {
+        if (!xmlBody) {
+            throw new Error('XML body is missing');
+        }
+        if (!this.hasHeaderPlaceholder(xmlBody)) {
+            throw new Error('Missing <!-- header --> placeholder');
+        }
+        if (!this.hasValidVersionAttribute(xmlBody)) {
+            throw new Error('Missing or invalid version attribute try to check the format vXX.X Make sure prefixing with "v"');
+        }
+        return true;
+    }
+
+    static hasHeaderPlaceholder(xmlBody) {
+        return /<!--\s*header\s*-->/.test(xmlBody);
+    }
+
+    static hasValidVersionAttribute(xmlBody) {
+        return /(wd|bsvc):version="v\d+\.\d+"/g.test(xmlBody);
+    }
+
+    static insertBasicAuthHeader(xmlBody, credentials) {
+        const { userName, domain, password, env = CONFIG.XML_PREFIXES.ENV } = credentials;
+        const securityHeader = `<wsse:Security ${env}:mustUnderstand="1" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+            <wsse:UsernameToken>
+                <wsse:Username>${userName}@${domain}</wsse:Username>
+                <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">${password}</wsse:Password>
+            </wsse:UsernameToken>
+        </wsse:Security>`;
+        return xmlBody.replace(/<!--\s*header\s*-->/, securityHeader);
+    }
+
+    static transformXML(xmlBody) {
+        return xmlBody
+            .replace(/xmlns:(\w+)="http:\/\/schemas\.xmlsoap\.org\/soap\/envelope\/"/gi, 
+                    `xmlns:${CONFIG.XML_PREFIXES.ENV}="http://schemas.xmlsoap.org/soap/envelope/"`)
+            .replace(/xmlns:(\w+)="urn:com\.workday\/bsvc"/gi, 
+                    `xmlns:${CONFIG.XML_PREFIXES.WD}="urn:com.workday/bsvc"`)
+            .replace(/(\bsoapenv\b|\benv\b):/gi, `${CONFIG.XML_PREFIXES.ENV}:`)
+            .replace(/(\bbsvc\b|\bwd\b):/gi, `${CONFIG.XML_PREFIXES.WD}:`)
+            .replace(/<\/(\w+):/g, (match, p1) => {
+                if (/^(soapenv|env)$/i.test(p1)) return `</${CONFIG.XML_PREFIXES.ENV}:`;
+                if (/^(bsvc|wd)$/i.test(p1)) return `</${CONFIG.XML_PREFIXES.WD}:`;
+                return match;
+            });
+    }
+
+    static updateVersionAttribute(xmlBody, version) {
+        return xmlBody.replace(
+            /(wd|bsvc):version="v\d+\.\d+"/g,
+            `${CONFIG.XML_PREFIXES.WD}:version="v${version}"`
+        );
+    }
+}
+
+// OAuth Token Manager Class
+class OAuthTokenManager {
+    async isTokenExpired() {
+        const tokenExpiry = EnvironmentManager.get('tokenExpiry');
+        return !tokenExpiry || Date.now() >= parseInt(tokenExpiry);
+    }
+
+    async refreshToken() {
+        const tokenConfig = this.getTokenConfig();
+        try {
+            await this.requestNewToken(tokenConfig);
+        } catch (error) {
+            throw new Error(`Token refresh failed: ${error.message}`);
+        }
+    }
+
+    getTokenConfig() {
+        return {
+            baseURL: EnvironmentManager.get('baseURL'),
+            grantType: EnvironmentManager.get('grant_Type'),
+            clientId: EnvironmentManager.get('client_id'),
+            clientSecret: EnvironmentManager.get('client_secret'),
+            refreshToken: EnvironmentManager.get('refresh_token'),
+            endpoint: EnvironmentManager.get('endpoint')
+        };
+    }
+
+    async requestNewToken(config) {
+        const { baseURL, endpoint, clientId, clientSecret, grantType, refreshToken } = config;
+        const tokenUrl = `${baseURL}${endpoint}`;
+        const base64Credentials = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+
+        return new Promise((resolve, reject) => {
+            pm.sendRequest({
+                url: tokenUrl,
+                method: 'POST',
+                header: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Authorization': `Basic ${base64Credentials}`
+                },
+                body: {
+                    mode: 'urlencoded',
+                    urlencoded: [
+                        { key: 'grant_type', value: grantType },
+                        { key: 'refresh_token', value: refreshToken }
+                    ]
+                }
+            }, (err, response) => {
+                if (err) reject(err);
+                if (response.code === 200) {
+                    this.handleTokenResponse(response.json());
+                    resolve(response);
+                } else {
+                    reject(new Error(`Token request failed with status ${response.code}`));
+                }
+            });
+        });
+    }
+
+    handleTokenResponse(responseJson) {
+        EnvironmentManager.set('accessToken', responseJson.access_token);
+        if (responseJson.refresh_token) {
+            EnvironmentManager.set('refresh_token', responseJson.refresh_token);
+        }
+        const expiresIn = responseJson.expires_in || 0;
+        EnvironmentManager.set('tokenExpiry', Date.now() + expiresIn * 1000);
+    }
+}
+
+// Authentication Handler Class
+class AuthenticationHandler {
+    static async handle(authType) {
+        // First, remove any existing Authorization header regardless of auth type
+        this.removeAuthorizationHeader();
+
+        switch (authType) {
+            case CONFIG.AUTH_TYPES.BASIC:
+                // For Basic auth, only add Authorization header for GET requests
+                if (pm.request.method === "GET") {
+                    this.addBasicAuthHeader();
+                }
+                break;
+            case CONFIG.AUTH_TYPES.OAUTH:
+                // For OAuth, add Authorization header for all requests
+                await this.addOAuthHeader();
+                break;
+            default:
+                throw new Error(`Unsupported authentication type: ${authType}`);
+        }
+
+        // Handle POST request body if it exists
+        if (pm.request.method === "POST") {
+            await this.handlePostBody(authType);
+        }
+    }
+
+    static removeAuthorizationHeader() {
+        // Remove any existing Authorization header
+        const headers = pm.request.headers.toObject();
+        if (headers.Authorization || headers.authorization) {
+            pm.request.headers.remove('Authorization');
+            pm.request.headers.remove('authorization');
+            console.log("Removed existing Authorization header");
+        }
+    }
+
+    static addBasicAuthHeader() {
+        const userName = EnvironmentManager.get('userName');
+        const domain = EnvironmentManager.get('domain');
+        const password = EnvironmentManager.get('password');
+        
+        const credentials = Buffer.from(`${userName}@${domain}:${password}`).toString('base64');
+        pm.request.headers.add({
+            key: 'Authorization',
+            value: `Basic ${credentials}`
+        });
+        console.log("Added Basic Authorization header");
+    }
+
+    static async addOAuthHeader() {
+        const tokenManager = new OAuthTokenManager();
+        if (await tokenManager.isTokenExpired()) {
+            await tokenManager.refreshToken();
+        }
+        
+        const accessToken = EnvironmentManager.get('accessToken');
+        if (!accessToken) {
+            throw new Error('Access token not available');
+        }
+        
+        pm.request.headers.add({
+            key: 'Authorization',
+            value: `Bearer ${accessToken}`
+        });
+        console.log("Added OAuth Authorization header");
+    }
+
+    static async handlePostBody(authType) {
+        let xmlBody = pm.request.body.raw;
+        
+        try {
+            XMLProcessor.validateXMLBody(xmlBody);
+            
+            // Transform XML structure first
+            xmlBody = XMLProcessor.transformXML(xmlBody);
+            
+            // Update version attribute
+            const version = EnvironmentManager.get('version');
+            if (version) {
+                xmlBody = XMLProcessor.updateVersionAttribute(xmlBody, version);
+            }
+
+            // Insert appropriate authentication header in XML
+            if (authType === CONFIG.AUTH_TYPES.BASIC) {
+                xmlBody = await this.processXMLWithBasicAuth(xmlBody);
+            }
+
+			// console.log(xmlBody)
+            pm.request.body.update(xmlBody);
+            console.log(`Successfully processed XML with ${authType} authentication`);
+
+        } catch (error) {
+            throw new Error(`XML Processing Error: ${error.message}`);
+        }
+    }
+
+    static async processXMLWithBasicAuth(xmlBody) {
+        const credentials = {
+            userName: EnvironmentManager.get('userName'),
+            domain: EnvironmentManager.get('domain'),
+            password: EnvironmentManager.get('password')
+        };
+
+        return XMLProcessor.insertBasicAuthHeader(xmlBody, credentials);
+    }
+}
+
+// Main Execution
+async function main() {
+    try {
+        const authType = (EnvironmentManager.get('authentication_Type') || '').toLowerCase();
+        EnvironmentManager.validateEnvironment(authType);
+        await AuthenticationHandler.handle(authType);
+    } catch (error) {
+        console.error('Error:', error.message);
+        console.error('Stack:', error.stack);
+    }
+}
+
+// Start execution
+main();
